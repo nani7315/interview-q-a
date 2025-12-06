@@ -1,150 +1,185 @@
 import os
-from groq import Groq
+import json
 import streamlit as st
+from groq import Groq
 
-# -------------------- CONFIG -------------------- #
+# ------------------  CONFIG  ------------------ #
 
-# Groq model name
-GROQ_MODEL = "llama3-8b-8192"   # safe, still supported model
+MODEL_NAME = "llama-3.1-8b-instant"   # Current Groq fast model
 
 SYSTEM_PROMPT = """
-You are an Interview Preparation Assistant for Mechanical Engineering students.
+You are a Mechanical Engineering Interview Q&A generator.
 
-Your responsibilities:
-- Generate interview questions and give simple sample answers.
-- Cover both HR and core Mechanical Engineering technical questions.
-- Use easy English, like a well-prepared fresher in an interview.
-- For HR questions: 4–6 sentences, positive & professional.
-- For Technical questions: short exam-style explanation + 1 simple example.
-- Keep answers suitable for freshers (campus placement level).
+Your job:
+- Generate interview QUESTIONS with simple, professional sample ANSWERS.
+- Audience: Mechanical Engineering students / freshers.
+- Cover HR and/or Technical questions depending on user choice.
+- For technical questions, stay inside Mechanical topics like SOM, TOM, Thermal, FM,
+  Manufacturing, Design, etc.
+- Use very simple English.
+- Answers should sound like a well-prepared fresher speaking in an interview.
+
+OUTPUT FORMAT (IMPORTANT):
+Return ONLY JSON, no extra text.
+It must be a list of objects like:
+[
+  {
+    "question": "Question text here?",
+    "answer": "Answer text here."
+  },
+  ...
+]
 """
 
-# Create Groq client (expects GROQ_API_KEY in environment)
-def get_client():
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
+
+def get_client() -> Groq:
+    """Create a Groq client using the GROQ_API_KEY env variable."""
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return None, "GROQ_API_KEY environment variable is not set. " \
-                    "Please add it in Streamlit Cloud → Secrets as GROQ_API_KEY."
-    try:
-        client = Groq(api_key=api_key)
-        return client, None
-    except Exception as e:
-        return None, f"Error while creating Groq client: {e}"
+        raise RuntimeError(
+            "GROQ_API_KEY environment variable is not set. "
+            "Set it in your system or in Streamlit Cloud → App settings → Secrets."
+        )
+    return Groq(api_key=api_key)
 
 
-def generate_qa(role, q_type, subjects_text, count):
+def generate_qa(role: str, q_type: str, subjects_text: str, count: int):
     """
-    Ask Groq to generate questions + answers together.
-    Format: numbered list with Q and A.
+    Ask Groq to generate `count` Q&A pairs and return them as a Python list.
     """
-    client, err = get_client()
-    if err:
-        return f"⚠️ {err}"
 
     user_prompt = f"""
-Role: {role}
+I am preparing for an interview for the role: {role}.
+
 Question type: {q_type}
-Mechanical subjects focus: {subjects_text}
+- HR  -> only HR / personal / behavioral questions.
+- Technical -> only core Mechanical Engineering technical questions.
+- Both -> mix of HR and Technical questions.
 
-Generate {count} interview questions WITH simple answers.
+Technical subjects focus: {subjects_text}
 
-Format **exactly** like this:
-1. Q: <question text>
-   A: <simple answer in 4–6 sentences>
+Generate exactly {count} interview questions.
+For EACH question, also generate a simple, clear sample answer.
 
-2. Q: ...
-   A: ...
-    """
+Requirements:
+- Answers short and clean (3–6 sentences).
+- Use very simple English.
+- Suitable for a Mechanical Engineering fresher.
+- Return ONLY valid JSON as described in the system prompt.
+"""
+
+    client = get_client()
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        temperature=0.4,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    raw_text = response.choices[0].message.content.strip()
+
+    # The model may wrap JSON in ```json ... ``` – clean that.
+    if "```" in raw_text:
+        parts = raw_text.split("```")
+        # Try to find the json block
+        for p in parts:
+            if "{" in p or "[" in p:
+                raw_text = p.strip()
+                break
 
     try:
-        chat_completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.5,
-        )
-        return chat_completion.choices[0].message.content.strip()
+        qa_list = json.loads(raw_text)
+    except json.JSONDecodeError:
+        # Fallback: wrap into a single item if JSON fails
+        qa_list = [{"question": "Parsing error", "answer": raw_text}]
+
+    # Make sure it's a list
+    if isinstance(qa_list, dict):
+        qa_list = [qa_list]
+
+    return qa_list
+
+
+# ------------------  STREAMLIT APP  ------------------ #
+
+st.set_page_config(
+    page_title="Mechanical Interview Q&A Assistant",
+    page_icon="🤖",
+    layout="wide",
+)
+
+st.title("🤖 Mechanical Interview Q&A Assistant")
+st.write(
+    "Automatically generate interview **questions + simple answers** "
+    "for Mechanical Engineering roles."
+)
+
+# -------- Sidebar settings -------- #
+st.sidebar.header("Settings")
+
+role = st.sidebar.text_input(
+    "Target Role",
+    value="Mechanical Engineer - Fresher",
+)
+
+q_type = st.sidebar.selectbox(
+    "Question Type",
+    options=["HR", "Technical", "Both"],
+)
+
+tech_subjects = st.sidebar.multiselect(
+    "Technical Subjects (used when Technical/Both)",
+    options=[
+        "Strength of Materials (SOM)",
+        "Theory of Machines (TOM)",
+        "Thermodynamics",
+        "Heat Transfer",
+        "Fluid Mechanics",
+        "Manufacturing / Production",
+        "Machine Design",
+        "Engineering Mechanics",
+        "Material Science",
+    ],
+    default=[
+        "Strength of Materials (SOM)",
+        "Theory of Machines (TOM)",
+        "Thermodynamics",
+        "Manufacturing / Production",
+    ],
+)
+subjects_text = ", ".join(tech_subjects) if tech_subjects else "General Mechanical topics"
+
+count = st.sidebar.slider("Number of Q&A pairs", min_value=3, max_value=15, value=8)
+
+st.sidebar.info("Click **Generate Q&A** to create questions with answers.")
+
+# -------- Main button -------- #
+st.markdown("### 1️⃣ Generate Questions with Answers")
+
+if st.button("Generate Q&A"):
+    try:
+        with st.spinner("Talking to Groq and generating Q&A..."):
+            qa_list = generate_qa(role, q_type, subjects_text, count)
+
+        st.markdown("### Generated Q&A")
+        if not qa_list:
+            st.warning("No Q&A generated. Try again.")
+        else:
+            for idx, item in enumerate(qa_list, start=1):
+                question = item.get("question", "").strip()
+                answer = item.get("answer", "").strip()
+
+                with st.expander(f"Q{idx}. {question}"):
+                    st.write(answer)
+
     except Exception as e:
-        return f"⚠️ Error while calling Groq API:\n\n{e}"
+        st.error(f"⚠️ Error while calling Groq API:\n\n{e}")
 
-
-# -------------------- STREAMLIT UI -------------------- #
-
-def main():
-    st.set_page_config(
-        page_title="Mechanical Interview Q&A Assistant",
-        page_icon="🤖",
-        layout="wide",
-    )
-
-    st.title("🤖 Mechanical Interview Q&A Assistant")
-    st.caption("Automatically generate interview **questions + simple answers** for Mechanical Engineering roles.")
-
-    # -------- Sidebar settings -------- #
-    st.sidebar.header("⚙️ Settings")
-
-    role = st.sidebar.text_input(
-        "Target role",
-        value="Mechanical Engineer - Fresher",
-        help="Example: Design Engineer, Production Engineer, Maintenance Engineer, etc.",
-    )
-
-    q_type = st.sidebar.selectbox(
-        "Question type",
-        options=["HR", "Technical", "Both"],
-    )
-
-    tech_subjects = st.sidebar.multiselect(
-        "Technical subjects (for Technical / Both)",
-        options=[
-            "Strength of Materials (SOM)",
-            "Theory of Machines (TOM)",
-            "Thermodynamics",
-            "Heat Transfer",
-            "Fluid Mechanics",
-            "Manufacturing / Production",
-            "Machine Design",
-            "Engineering Mechanics",
-            "Material Science",
-        ],
-        default=[
-            "Strength of Materials (SOM)",
-            "Theory of Machines (TOM)",
-            "Thermodynamics",
-            "Manufacturing / Production",
-        ],
-    )
-
-    subjects_text = ", ".join(tech_subjects) if tech_subjects else "General Mechanical Engineering topics"
-
-    num_questions = st.sidebar.slider(
-        "Number of questions",
-        min_value=3,
-        max_value=15,
-        value=8,
-    )
-
-    st.sidebar.info("Click **Generate Q&A** to get questions with ready-made simple answers.")
-
-    # -------- Main area -------- #
-    st.markdown("### 1️⃣ Generate Questions **with Answers**")
-
-    if st.button("Generate Q&A"):
-        with st.spinner("Generating interview questions and answers..."):
-            qa_text = generate_qa(role, q_type, subjects_text, num_questions)
-
-        st.markdown("#### Generated Q&A")
-        st.markdown(
-            qa_text if qa_text.startswith("⚠️") else "```text\n" + qa_text + "\n```"
-        )
-    else:
-        st.write("Set your options on the left and press **Generate Q&A** to start.")
-
-    st.markdown("---")
-    st.caption("Tip: Change role / question type / subjects and generate again for more practice sets.")
-
-
-if __name__ == "__main__":
-    main()
+st.markdown("---")
+st.caption(
+    "Tip: Change role / question type / subjects in the sidebar and click "
+    "**Generate Q&A** again for more practice sets."
+)
