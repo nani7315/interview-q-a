@@ -1,4 +1,5 @@
 streamlit
 groq
-pypdf
-python-docx
+fpdf2
+PyPDF2
+docx2txt
