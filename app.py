@@ -1,378 +1,359 @@
 import os
-import io
+from io import BytesIO
 from typing import Optional
 
 import streamlit as st
 from groq import Groq
 from fpdf import FPDF
 
-# Optional: only needed if you really want to read PDF/DOCX content.
-# Make sure these are in requirements.txt if you use them.
-try:
-    import PyPDF2
-    import docx2txt
-    HAS_DOC_LIBS = True
-except Exception:
-    HAS_DOC_LIBS = False
+# ---------- CONFIG ---------- #
 
+# Groq model – change here if Groq deprecates this model in future
+MODEL_NAME = "llama-3.1-8b-instant"
 
-# ------------------------- CONFIG ------------------------- #
-
-st.set_page_config(
-    page_title="Mechanical Interview Q&A Assistant",
-    layout="wide"
-)
-
-# ---- Groq client (put your key in environment variable GROQ_API_KEY) ---- #
+# Get API key from environment variable
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=GROQ_API_KEY)
 
-# Use a CURRENT Groq chat model name here.
-# If this model ever gets decommissioned, just change the string.
-MODEL_NAME = "llama-3.1-70b-versatile"  # <-- update from Groq console if needed
+if not GROQ_API_KEY:
+    st.warning(
+        "⚠️ GROQ_API_KEY environment variable not set. "
+        "Set it in your system / Streamlit Cloud secrets."
+    )
 
-
-# --------------------- HELPER FUNCTIONS ------------------- #
-
-def call_groq(system_prompt: str, user_prompt: str) -> str:
-    """Call Groq chat completion with given prompts."""
-    if not GROQ_API_KEY:
-        return "⚠️ GROQ_API_KEY is not set. Please set it as an environment variable."
-
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.4,
-        )
-        return completion.choices[0].message.content.strip()
-    except Exception as e:
-        return f"⚠️ Error while calling Groq API:\n{e}"
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-def extract_text_from_resume(uploaded_file) -> str:
-    """Try to extract plain text from PDF/DOCX/TXT resume."""
-    if uploaded_file is None:
-        return ""
+# ---------- SMALL HELPERS ---------- #
 
-    filename = uploaded_file.name.lower()
-
-    if not HAS_DOC_LIBS:
-        # Fallback – just try to decode as text
-        return uploaded_file.read().decode("utf-8", errors="ignore")
-
-    try:
-        if filename.endswith(".pdf"):
-            reader = PyPDF2.PdfReader(uploaded_file)
-            text = ""
-            for page in reader.pages:
-                text += page.extract_text() or ""
-            return text
-
-        elif filename.endswith(".docx"):
-            # docx2txt needs a path-like object; uploaded_file works directly
-            return docx2txt.process(uploaded_file)
-
-        else:
-            # Assume text
-            return uploaded_file.read().decode("utf-8", errors="ignore")
-
-    except Exception:
-        # Last fallback
-        return uploaded_file.read().decode("utf-8", errors="ignore")
+def safe_pdf_text(line: str) -> str:
+    """
+    FPDF (fpdf2) only supports latin-1. This converts any unicode text
+    to latin-1 with replacement so we don't get FPDFUnicodeEncodingException.
+    """
+    return line.encode("latin-1", "replace").decode("latin-1")
 
 
-def build_pdf(text: str, title: str) -> bytes:
-    """Create a simple PDF from given text and return it as bytes."""
+def make_pdf_from_text(title: str, content: str) -> bytes:
+    """Create a PDF in memory from plain text and return bytes."""
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+    pdf.set_title(safe_pdf_text(title))
 
-    # Title
     pdf.set_font("Arial", "B", 16)
-    pdf.multi_cell(0, 10, title)
-    pdf.ln(4)
+    pdf.cell(0, 10, safe_pdf_text(title), ln=True)
 
-    # Body
-    pdf.set_font("Arial", "", 11)
-    for line in text.splitlines():
-        if not line.strip():
-            pdf.ln(4)
-        else:
-            pdf.multi_cell(0, 6, line)
+    pdf.ln(5)
+    pdf.set_font("Arial", size=11)
+
+    for line in content.split("\n"):
+        pdf.multi_cell(0, 6, safe_pdf_text(line))
 
     pdf_bytes = pdf.output(dest="S").encode("latin-1")
     return pdf_bytes
 
 
-def qa_system_prompt(round_name: str) -> str:
-    """Base system prompt for Q&A with the required format."""
+def read_resume_file(uploaded_file) -> str:
+    """Very simple resume text extractor (PDF/TXT/DOCX)."""
+    if uploaded_file is None:
+        return ""
+
+    suffix = uploaded_file.name.lower().split(".")[-1]
+
+    if suffix == "txt":
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+
+    if suffix == "pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(uploaded_file)
+            pages = [p.extract_text() or "" for p in reader.pages]
+            return "\n".join(pages)
+        except Exception:
+            return ""
+
+    if suffix in ("docx", "doc"):
+        try:
+            import docx
+            doc = docx.Document(uploaded_file)
+            return "\n".join(p.text for p in doc.paragraphs)
+        except Exception:
+            return ""
+
+    # Fallback
+    return ""
+
+
+def call_groq(prompt: str, max_tokens: int = 4096) -> Optional[str]:
+    if client is None:
+        return "⚠️ Groq client is not initialised. Please set GROQ_API_KEY."
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a Mechanical Engineering interview assistant. "
+                        "You ONLY ask and answer INTERVIEW questions, no stories."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"⚠️ Error while calling Groq API:\n{e}"
+
+
+def build_qa_prompt(
+    section_label: str,
+    num_questions: int,
+    company_name: str,
+    job_role: str,
+    company_process: str,
+    resume_text: str = "",
+    focus: str = "",
+) -> str:
+    """
+    Shared prompt builder. The model will return questions ONLY in the requested style.
+    """
+
     return f"""
-You are an expert Mechanical Engineering interview coach.
+You are generating interview questions for a **Mechanical Engineering fresher**.
 
-Round / section: {round_name}.
+Section: {section_label}
 
-Your job:
-- Generate ONLY theoretical interview questions (no coding, no implementation details).
-- Cover from simple / basic level to moderately advanced level.
-- Use clear and easy English.
-- Make the content suitable for a Mechanical Engineering student / fresher.
+Number of questions: {num_questions}
 
-Strict output format for EVERY item:
-Q: **Question text here?**        <-- question must be bold using Markdown
-A: Short, simple, interview-style answer (3–6 lines).
-F: One relevant formula / tiny numerical example / key point.
-   If there is no natural formula, write: F: —.
+Company name: {company_name or "Not specified"}
+Job role: {job_role or "Mechanical Engineer"}
+Company process / products / domain: {company_process or "Not specified"}
 
-- Each Q/A/F block must be separated by exactly ONE blank line.
-- Do NOT number the questions.
+Extra focus (if any): {focus or "General mechanical theory"}
+
+If resume text is provided, use it mainly for RESUME-based questions.
+Resume text:
+\"\"\"{resume_text[:5000]}\"\"\"   # truncate just in case
+
+RULES (VERY IMPORTANT – FOLLOW STRICTLY):
+
+1. ONLY give **theoretical** questions (no long numerical problems, no coding).
+2. Questions should start from **basic** level and then go to **moderate / little advanced**.
+3. For each question, output exactly this pattern:
+
+   **Q1. Question text here?**
+   A: Simple, clean answer in 3–6 sentences, suitable for a fresher.
+   F: Important formula, law or key point related to this concept.
+      If no formula is needed, write: F: No key formula, only concept.
+
+4. Q should be bold as in Markdown (**Q1. ...**) so it appears highlighted.
+5. Keep language simple and interview-style.
+6. DO NOT mix different sections. Only generate Q&A for this section: {section_label}.
+7. Generate exactly {num_questions} Q&A pairs if possible.
+
+Output MUST be pure Markdown text containing only the Q / A / F blocks.
 """
 
 
-# ------------------------ SESSION STATE ------------------------ #
+# ---------- STREAMLIT UI ---------- #
 
-for key in [
-    "resume_text",
-    "resume_round_qa",
-    "tech_round_qa",
-    "hr_round_qa",
-]:
-    if key not in st.session_state:
-        st.session_state[key] = ""
-
-
-# --------------------------- UI START -------------------------- #
+st.set_page_config(
+    page_title="Mechanical Interview Q&A Assistant",
+    layout="wide",
+)
 
 st.title("🧠 Mechanical Interview Q&A Assistant")
 st.write(
-    "Automatically generate interview **questions** + **simple answers** for "
-    "Mechanical Engineering roles. All questions follow the format `Q / A / F`."
+    "Automatically generate **theoretical interview questions + simple answers + formulas** "
+    "for Mechanical Engineering roles."
 )
 
-st.markdown("---")
+st.divider()
 
-# ======================= 1. Upload resume ======================= #
-
+# 1) UPLOAD RESUME
 st.header("1️⃣ Upload your resume")
 
 uploaded_resume = st.file_uploader(
-    "Upload your resume (PDF, DOCX or TXT)",
-    type=["pdf", "docx", "txt"],
-    help="Resume will be used only to generate interview questions."
+    "Upload resume file (PDF, DOCX, or TXT)",
+    type=["pdf", "docx", "doc", "txt"],
 )
 
-if uploaded_resume is not None:
-    st.session_state.resume_text = extract_text_from_resume(uploaded_resume)
-    st.success("Resume uploaded and text extracted successfully (for Q&A generation).")
-else:
-    st.info("Please upload your resume to enable resume-based questions.")
+resume_text = read_resume_file(uploaded_resume)
 
-st.markdown("---")
+if uploaded_resume and not resume_text:
+    st.warning("Could not read text from this file. Try a simpler PDF/TXT if possible.")
 
-# ================== 2. Company & role details =================== #
+if resume_text:
+    with st.expander("🔍 Preview extracted resume text (first 1000 chars)", expanded=False):
+        st.text(resume_text[:1000])
 
-st.header("2️⃣ Company & role details")
+st.divider()
+
+# 2) COMPANY DETAILS & PROCESS
+st.header("2️⃣ Company details & process")
 
 col1, col2 = st.columns(2)
 with col1:
-    company_name = st.text_input("Company name", placeholder="Example: Medha Servo Drives")
-    role_name = st.text_input("Target role", placeholder="Example: Graduate Engineer Trainee (Mechanical)")
+    company_name = st.text_input("Company name", placeholder="e.g., Medha Servo Drives")
 with col2:
-    company_domain = st.text_input(
-        "Domain / department",
-        placeholder="Example: R&D, Design, Production, Quality, Maintenance"
-    )
-    location = st.text_input("Location (optional)", placeholder="Example: Hyderabad")
+    job_role = st.text_input("Job role", placeholder="e.g., Graduate Mechanical Engineer")
 
-process_text = st.text_area(
-    "Company process / technologies / job description (optional)",
+company_process = st.text_area(
+    "Describe company products / process / domain (will help to aim questions)",
     placeholder=(
-        "Example:\n"
-        "- Written test on basics of Mechanical + aptitude\n"
-        "- Technical interview on design, thermodynamics, SOM, TOM\n"
-        "- HR round about relocation, strengths, teamwork\n"
-        "- Uses tools: AutoCAD, SolidWorks, Ansys etc."
+        "Example: Company designs and manufactures traction motors, power electronics, "
+        "control systems for railway locomotives, etc."
     ),
-    height=150
 )
 
-st.markdown("---")
+st.divider()
 
-# ========== 3. Resume-based interview questions & answers ========= #
+# Question count (for all sections)
+num_questions = st.slider(
+    "Number of questions for each section",
+    min_value=5,
+    max_value=50,
+    value=20,
+    step=5,
+    help="Be careful: very high numbers can generate a long response.",
+)
+
+# We'll store generated texts in session_state so that download buttons work.
+if "resume_qa" not in st.session_state:
+    st.session_state.resume_qa = ""
+if "subject_qa" not in st.session_state:
+    st.session_state.subject_qa = ""
+if "hr_qa" not in st.session_state:
+    st.session_state.hr_qa = ""
+
+
+# ---------- 3) RESUME-BASED Q&A ---------- #
 
 st.header("3️⃣ Resume-based interview questions")
 
-num_resume_q = st.slider(
-    "Number of resume-based Q&A (basic → advanced)",
-    min_value=5,
-    max_value=50,
-    value=15,
-    step=5,
+st.write(
+    "These focus on your **projects, skills, internships, tools, strengths** written in the resume."
 )
 
-if st.button("Generate resume-based Q&A"):
-    if not st.session_state.resume_text.strip():
-        st.warning("Please upload your resume first.")
+if st.button("Generate RESUME-based Q&A"):
+    if not resume_text:
+        st.warning("Please upload a resume first.")
     else:
-        system_prompt = qa_system_prompt("Resume based interview")
-        user_prompt = f"""
-Here is the candidate's resume text:
+        with st.spinner("Generating resume-based questions & answers..."):
+            prompt = build_qa_prompt(
+                section_label="Resume-based interview round",
+                num_questions=num_questions,
+                company_name=company_name,
+                job_role=job_role,
+                company_process=company_process,
+                resume_text=resume_text,
+                focus="Ask about projects, tools, software, internships, strengths mentioned in resume.",
+            )
+            st.session_state.resume_qa = call_groq(prompt)
 
-\"\"\"{st.session_state.resume_text[:6000]}\"\"\"
+st.subheader("Resume-based Q&A")
 
-Generate {num_resume_q} interview Q&A **based ONLY on the resume**.
-Follow the required Q/A/F format exactly.
-"""
-        st.session_state.resume_round_qa = call_groq(system_prompt, user_prompt)
+if st.session_state.resume_qa:
+    st.markdown(st.session_state.resume_qa)
 
-if st.session_state.resume_round_qa:
-    st.subheader("Resume-based Q&A")
-    st.markdown("Below are the questions generated from your resume:")
-
-    st.text_area(
-        "Resume-based Q&A (copy if you want)",
-        value=st.session_state.resume_round_qa,
-        height=400,
-    )
-
-    pdf_bytes = build_pdf(
-        st.session_state.resume_round_qa,
-        "Resume-based Mechanical Interview Q&A"
-    )
+    pdf_bytes = make_pdf_from_text("Resume-based Q&A", st.session_state.resume_qa)
     st.download_button(
-        "⬇️ Download resume-based Q&A as PDF",
+        "📥 Download this section as PDF",
         data=pdf_bytes,
-        file_name="resume_round_QA.pdf",
+        file_name="resume_based_QA.pdf",
         mime="application/pdf",
     )
+else:
+    st.info("Click **Generate RESUME-based Q&A** to create questions for this section.")
 
-st.markdown("---")
+st.divider()
 
-# =========== 4. Subject / company-specific technical round ======= #
+# ---------- 4) COMPANY SUBJECT / TECHNICAL Q&A ---------- #
 
-st.header("4️⃣ Technical round – subject / company knowledge")
+st.header("4️⃣ Company-related subject questions (technical)")
 
-subjects = st.text_input(
-    "Main subjects for this company & role",
-    placeholder="Example: Strength of Materials, Theory of Machines, Thermodynamics, Manufacturing"
+st.write(
+    "Pure **theoretical subject questions** related to the company domain "
+    "(design, manufacturing, thermal, machines, etc.)."
 )
 
-num_tech_q = st.slider(
-    "Number of technical Q&A (basic → advanced)",
-    min_value=10,
-    max_value=50,
-    value=20,
-    step=5,
+subject_focus = st.text_input(
+    "Subject / domain focus (optional)",
+    placeholder="e.g., Strength of Materials, Theory of Machines, Thermal, Manufacturing…",
 )
 
-if st.button("Generate technical round Q&A"):
-    system_prompt = qa_system_prompt("Technical round – company / subject knowledge")
+if st.button("Generate TECHNICAL Q&A"):
+    with st.spinner("Generating technical questions & answers..."):
+        prompt = build_qa_prompt(
+            section_label="Company related technical round",
+            num_questions=num_questions,
+            company_name=company_name,
+            job_role=job_role,
+            company_process=company_process,
+            resume_text="",  # here we don't need resume content
+            focus=subject_focus or "core mechanical subjects relevant to the company domain",
+        )
+        st.session_state.subject_qa = call_groq(prompt)
 
-    user_prompt = f"""
-Company: {company_name or "N/A"}
-Role: {role_name or "N/A"}
-Domain / Dept: {company_domain or "N/A"}
-Location: {location or "N/A"}
+st.subheader("Technical Q&A")
 
-Subjects to focus on: {subjects or "core Mechanical Engineering subjects"}
-Company process / technologies / JD notes:
-\"\"\"{process_text[:2000]}\"\"\"
+if st.session_state.subject_qa:
+    st.markdown(st.session_state.subject_qa)
 
-Generate {num_tech_q} theoretical interview questions **for this company & role**.
-- Start with very basic concept questions.
-- Then move slowly to more advanced, but still undergraduate Mechanical level.
-- Only theory (definitions, concepts, simple formula-based questions).
-
-Follow the strict Q/A/F format for every item.
-"""
-
-    st.session_state.tech_round_qa = call_groq(system_prompt, user_prompt)
-
-if st.session_state.tech_round_qa:
-    st.subheader("Technical round Q&A")
-    st.text_area(
-        "Technical Q&A",
-        value=st.session_state.tech_round_qa,
-        height=450,
-    )
-
-    pdf_bytes = build_pdf(
-        st.session_state.tech_round_qa,
-        "Technical Round Mechanical Interview Q&A"
-    )
+    pdf_bytes = make_pdf_from_text("Technical Q&A", st.session_state.subject_qa)
     st.download_button(
-        "⬇️ Download technical round Q&A as PDF",
+        "📥 Download this section as PDF",
         data=pdf_bytes,
-        file_name="technical_round_QA.pdf",
+        file_name="technical_QA.pdf",
         mime="application/pdf",
     )
+else:
+    st.info("Click **Generate TECHNICAL Q&A** to create questions for this section.")
 
-st.markdown("---")
+st.divider()
 
-# ========================= 5. HR round =========================== #
+# ---------- 5) HR ROUND Q&A ---------- #
 
 st.header("5️⃣ HR round questions")
 
-num_hr_q = st.slider(
-    "Number of HR Q&A",
-    min_value=10,
-    max_value=50,
-    value=20,
-    step=5,
+st.write(
+    "Behavioural and HR questions such as strengths, weaknesses, teamwork, relocation, etc."
 )
 
-if st.button("Generate HR round Q&A"):
-    system_prompt = qa_system_prompt("HR round – behavioural & general")
+if st.button("Generate HR Q&A"):
+    with st.spinner("Generating HR questions & answers..."):
+        prompt = build_qa_prompt(
+            section_label="HR interview round",
+            num_questions=num_questions,
+            company_name=company_name,
+            job_role=job_role,
+            company_process=company_process,
+            resume_text=resume_text,
+            focus="HR questions: about candidate personality, teamwork, goals, family background, relocation, etc.",
+        )
+        st.session_state.hr_qa = call_groq(prompt)
 
-    user_prompt = f"""
-Generate {num_hr_q} HR round interview questions for:
+st.subheader("HR Q&A")
 
-Company: {company_name or "N/A"}
-Role: {role_name or "Mechanical Engineer – Fresher"}
+if st.session_state.hr_qa:
+    st.markdown(st.session_state.hr_qa)
 
-Focus areas:
-- Self introduction, strengths, weaknesses
-- Teamwork, conflicts, leadership, time management
-- Relocation, shift work, long-term goals
-- Family background in a simple, respectful way
-- Basic questions about why this company and this role
-
-Even though these are HR questions, still follow this format:
-
-Q: **HR question text here?**
-A: Polished, professional sample answer (5–8 sentences).
-F: Extra note / small tip for the candidate ("F: Tip: Keep answer honest...", etc.)
-
-Use only theory / discussion, do not ask the candidate to perform any task.
-"""
-
-    st.session_state.hr_round_qa = call_groq(system_prompt, user_prompt)
-
-if st.session_state.hr_round_qa:
-    st.subheader("HR round Q&A")
-    st.text_area(
-        "HR Q&A",
-        value=st.session_state.hr_round_qa,
-        height=450,
-    )
-
-    pdf_bytes = build_pdf(
-        st.session_state.hr_round_qa,
-        "HR Round Interview Q&A"
-    )
+    pdf_bytes = make_pdf_from_text("HR Q&A", st.session_state.hr_qa)
     st.download_button(
-        "⬇️ Download HR round Q&A as PDF",
+        "📥 Download this section as PDF",
         data=pdf_bytes,
-        file_name="hr_round_QA.pdf",
+        file_name="hr_QA.pdf",
         mime="application/pdf",
     )
+else:
+    st.info("Click **Generate HR Q&A** to create questions for this section.")
 
-st.markdown("---")
+st.divider()
 
 st.caption(
-    "Tip: You can tweak company details, subjects, and number of questions, "
-    "then regenerate and download fresh PDFs for each section."
+    "Tip: You can change number of questions, company details or subject focus and generate again for more practice sets."
 )
